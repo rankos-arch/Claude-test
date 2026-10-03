@@ -129,9 +129,24 @@ function generate(lv) {
     return out;
   };
 
+  const makeVehicle = (x, y, len, dir, state) => {
+    const v = { id: vehicles.length, x, y, len, dir, cap: len === 3 ? 10 : (rng() < 0.5 ? 4 : 6),
+      color: COLORS[Math.floor(rng() * numColors)],
+      state, filled: 0, reserved: 0, bump: 0, bumpT: 0, bumpMax: 0, slot: -1, alpha: 1, emerge: 0 };
+    vehicles.push(v);
+    return v;
+  };
+  // Cell directly behind a vehicle's rear, where its tunnel would sit.
+  const behind = (x, y, len, dir) => [[x, y + len], [x - 1, y], [x, y - 1], [x + len, y]][dir];
+
+  const placed = [];      // placement order (first vehicle of each tunnel only)
+  const tunnels = [];
+  const inPath = new Set(); // cells some placed vehicle must drive through
+  const maxTunnels = lv < 4 ? 0 : lv < 8 ? 1 : lv < 14 ? 2 : 3;
+
   // Each new vehicle needs a clear exit path among those already placed,
   // so removing them in reverse placement order always works.
-  for (let a = 0; a < 6000 && vehicles.length < target; a++) {
+  for (let a = 0; a < 6000 && placed.length < target; a++) {
     const len = rng() < 0.3 ? 3 : 2;
     const dir = Math.floor(rng() * 4);
     const horiz = dir % 2 === 1;
@@ -139,16 +154,39 @@ function generate(lv) {
     const y = Math.floor(rng() * (N - (horiz ? 0 : len - 1)));
     const cells = cellsOf(x, y, len, dir);
     if (cells.some(([cx, cy]) => occ[cy * N + cx] !== -1)) continue;
-    if (pathOf(x, y, len, dir).some(([cx, cy]) => occ[cy * N + cx] !== -1)) continue;
-    const id = vehicles.length;
-    cells.forEach(([cx, cy]) => occ[cy * N + cx] = id);
-    const cap = len === 3 ? 10 : (rng() < 0.5 ? 4 : 6);
-    vehicles.push({ id, x, y, len, dir, cap, color: COLORS[Math.floor(rng() * numColors)],
-      state: 'board', filled: 0, reserved: 0, bump: 0, bumpT: 0, bumpMax: 0, slot: -1, alpha: 1 });
+    const path = pathOf(x, y, len, dir);
+    if (path.some(([cx, cy]) => occ[cy * N + cx] !== -1)) continue;
+
+    // Tunnel: a permanent block behind the vehicle that refills its cells.
+    // It must never sit in anyone's exit path.
+    let tunnel = null;
+    if (tunnels.length < maxTunnels && placed.length > 2 && rng() < 0.25) {
+      const [tx, ty] = behind(x, y, len, dir);
+      if (tx >= 0 && ty >= 0 && tx < N && ty < N && occ[ty * N + tx] === -1 && !inPath.has(ty * N + tx))
+        tunnel = { x: tx, y: ty, dir, queue: [], wait: 0, shake: 0 };
+    }
+
+    const v = makeVehicle(x, y, len, dir, 'board');
+    cells.forEach(([cx, cy]) => occ[cy * N + cx] = v.id);
+    path.forEach(([cx, cy]) => inPath.add(cy * N + cx));
+    v.chain = [v];
+    if (tunnel) {
+      occ[tunnel.y * N + tunnel.x] = -2;
+      const extra = 2 + Math.floor(rng() * (lv < 10 ? 3 : 4));
+      for (let k = 0; k < extra; k++) {
+        const t = makeVehicle(x, y, len, dir, 'tunnel');
+        tunnel.queue.push(t); v.chain.push(t);
+      }
+      tunnel.spawn = cells;
+      tunnels.push(tunnel);
+    }
+    placed.push(v);
   }
 
+  // Solution order: reverse placement; a tunnel's vehicles follow right after the first one,
+  // since each new one reappears in the same cells with the same (clear) exit path.
+  const order = placed.slice().reverse().flatMap(v => v.chain);
   // Build passenger queue following the solution order, interleaving a window of vehicles.
-  const order = vehicles.slice().reverse();
   const queue = [];
   const active = [];
   let idx = 0;
@@ -162,7 +200,8 @@ function generate(lv) {
     a.rem -= chunk;
     if (a.rem === 0) { active.splice(ai, 1); refill(); }
   }
-  return { N, occ, vehicles, queue, hard: windowSize };
+  vehicles.forEach(v => delete v.chain);
+  return { N, occ, vehicles, tunnels, queue, hard: windowSize, solution: order.map(v => v.id) };
 }
 
 function startLevel(lv) {
@@ -191,7 +230,8 @@ function gridPose(v) {
   let cx = horiz ? ox + (v.x + v.len / 2) * cell : ox + (v.x + 0.5) * cell;
   let cy = horiz ? oy + (v.y + 0.5) * cell : oy + (v.y + v.len / 2) * cell;
   const [dx, dy] = DIRS[v.dir];
-  cx += dx * v.bump; cy += dy * v.bump;
+  const off = v.bump - v.emerge * v.len * cell;
+  cx += dx * off; cy += dy * off;
   return { x: cx, y: cy, a: ANG[v.dir], L: v.len * cell - 8, Wd: cell - 12 };
 }
 function parkedPose(v) {
@@ -208,6 +248,7 @@ function blockInfo(v) {
     const cx = fx + dx * k, cy = fy + dy * k;
     if (cx < 0 || cy < 0 || cx >= N || cy >= N) return { free: true };
     const o = occ[cy * N + cx];
+    if (o === -2) return { free: false, d: k - 1, blocker: G.tunnels.find(t => t.x === cx && t.y === cy) };
     if (o !== -1) return { free: false, d: k - 1, blocker: G.vehicles[o] };
   }
 }
@@ -249,12 +290,12 @@ cv.addEventListener('pointerdown', e => {
   const gx = Math.floor((x - ox) / cell), gy = Math.floor((y - oy) / cell);
   if (gx < 0 || gy < 0 || gx >= N || gy >= N) return;
   const id = G.occ[gy * N + gx];
-  if (id === -1) return;
+  if (id < 0) return;
   tapVehicle(G.vehicles[id]);
 });
 
 function tapVehicle(v) {
-  if (v.state !== 'board' || v.bumpT > 0) return;
+  if (v.state !== 'board' || v.bumpT > 0 || v.emerge > 0) return;
   if (freeSlot() === -1) { toast('Geen vrije parkeerplek!'); v.shake = 0.3; return; }
   if (G.vipMode) {
     G.vipMode = false; G.boosters.vip--;
@@ -314,7 +355,20 @@ function update(dt) {
   if (G.toast) { G.toast.t -= dt; if (G.toast.t <= 0) G.toast = null; }
   G.shift = Math.max(0, G.shift - dt * 16);
 
+  for (const t of G.tunnels) {
+    if (t.shake) t.shake = Math.max(0, t.shake - dt);
+    if (!t.queue.length) continue;
+    if (t.spawn.every(([cx, cy]) => G.occ[cy * G.N + cx] === -1)) {
+      t.wait += dt;
+      if (t.wait > 0.2) {
+        const v = t.queue.shift();
+        t.spawn.forEach(([cx, cy]) => G.occ[cy * G.N + cx] = v.id);
+        v.state = 'board'; v.emerge = 1; t.wait = 0;
+      }
+    } else t.wait = 0;
+  }
   for (const v of G.vehicles) {
+    if (v.emerge) v.emerge = Math.max(0, v.emerge - dt * 3.5);
     if (v.shake) v.shake = Math.max(0, v.shake - dt);
     if (v.bumpT > 0) {
       v.bumpT += dt;
@@ -496,6 +550,26 @@ function drawVehicle(v, p) {
   ctx.restore();
 }
 
+function drawTunnel(t) {
+  const { ox, oy, cell } = G;
+  const cx = ox + (t.x + 0.5) * cell + (t.shake ? Math.sin(t.shake * 80) * 2 : 0), cy = oy + (t.y + 0.5) * cell;
+  const s = cell - 6;
+  ctx.save(); ctx.translate(cx, cy); ctx.rotate(ANG[t.dir]);
+  ctx.fillStyle = 'rgba(0,0,0,0.25)'; rrect(-s / 2 + 2, -s / 2 + 4, s, s, 10); ctx.fill();
+  ctx.fillStyle = '#7f93c4'; rrect(-s / 2, -s / 2, s, s, 10); ctx.fill();
+  ctx.fillStyle = '#b4c4e8'; rrect(-s / 2 + 3, -s / 2 + 3, s - 6, s - 9, 8); ctx.fill();
+  // dark opening facing the exit direction
+  ctx.fillStyle = '#1e2333';
+  rrect(s / 2 - s * 0.32, -s * 0.34, s * 0.32, s * 0.68, 6); ctx.fill();
+  ctx.fillStyle = '#3a4058'; ctx.fillRect(s / 2 - s * 0.32, -s * 0.34, 4, s * 0.68);
+  ctx.restore();
+  // remaining count badge
+  ctx.fillStyle = t.queue.length ? '#a0522d' : '#94a3b8';
+  rrect(cx + s / 2 - 16, cy + s / 2 - 14, 22, 20, 6); ctx.fill();
+  ctx.fillStyle = '#fff'; ctx.font = 'bold 14px system-ui, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(t.queue.length, cx + s / 2 - 5, cy + s / 2 - 3);
+}
+
 function drawTop() {
   // grass
   ctx.fillStyle = '#7cc35a'; ctx.fillRect(0, 0, W, 340);
@@ -633,7 +707,18 @@ function render() {
   drawTop();
   drawBoard();
   // board vehicles
-  for (const v of G.vehicles) if (v.state === 'board') drawVehicle(v, gridPose(v));
+  for (const v of G.vehicles) {
+    if (v.state !== 'board') continue;
+    if (v.emerge) {
+      // only show the part that has come out of the tunnel
+      const { ox, oy, cell } = G;
+      const xs = [v.x, v.dir % 2 ? v.x + v.len - 1 : v.x], ys = [v.y, v.dir % 2 ? v.y : v.y + v.len - 1];
+      ctx.save(); ctx.beginPath();
+      ctx.rect(ox + xs[0] * cell - 4, oy + ys[0] * cell - 4, (xs[1] - xs[0] + 1) * cell + 8, (ys[1] - ys[0] + 1) * cell + 8);
+      ctx.clip(); drawVehicle(v, gridPose(v)); ctx.restore();
+    } else drawVehicle(v, gridPose(v));
+  }
+  for (const t of G.tunnels) drawTunnel(t);
   for (const v of G.vehicles) if (v.state === 'parked' || v.state === 'leave') drawVehicle(v, v.pose);
   drawSlotsInfo();
   for (const v of G.vehicles) if (v.state === 'exit' || v.state === 'fly') drawVehicle(v, v.pose);

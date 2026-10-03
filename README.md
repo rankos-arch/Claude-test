@@ -9,6 +9,8 @@ Open `index.html` in een browser (werkt ook op mobiel).
 - Een bus die vrij wegrijdt, parkeert op een vrije parkeerplek bovenaan.
 - Passagiers vooraan in de rij stappen in een geparkeerde bus van hun kleur.
 - Een volle bus vertrekt en maakt de plek weer vrij.
+- Tunnels (vanaf level 4): zodra het vak voor een tunnel vrij is, rijdt de volgende bus eruit.
+  Het getal geeft aan hoeveel bussen er nog in zitten. Tunnels zelf blokkeren ook.
 - Zijn alle plekken bezet en past de voorste passagier nergens in? Dan zit je vast.
 
 ## Boosters
