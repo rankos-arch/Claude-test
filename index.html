@@ -1,0 +1,683 @@
+<!doctype html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Bus Jam</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1d2a3a; overflow: hidden; touch-action: none; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+// ---------- Constants ----------
+const W = 540, H = 1000;
+const COLORS = ['#f0373d', '#2f7cf0', '#ffd21f', '#35c94a', '#9b4bea', '#ff8a1f', '#ff5fb8', '#3fe0ea', '#9a5426'];
+const DIRS = [[0, -1], [1, 0], [0, 1], [-1, 0]]; // up, right, down, left
+const ANG = [-Math.PI / 2, 0, Math.PI / 2, Math.PI];
+const MAX_SLOTS = 7, BASE_SLOTS = 4;
+const SLOT_W = 62, SLOT_H = 108, SLOT_Y = 352;
+const SLOT_X0 = (W - MAX_SLOTS * 70) / 2 + 4;
+const FRONT = { x: 270, y: 312 };
+const SPACING = 15;
+
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+let scale = 1, offX = 0, offY = 0;
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  cv.width = innerWidth * dpr; cv.height = innerHeight * dpr;
+  scale = Math.min(innerWidth / W, innerHeight / H);
+  offX = (innerWidth - W * scale) / 2; offY = (innerHeight - H * scale) / 2;
+  ctx.setTransform(dpr * scale, 0, 0, dpr * scale, dpr * offX, dpr * offY);
+}
+addEventListener('resize', resize);
+
+// ---------- Helpers ----------
+function rngFrom(seed) {
+  return function () {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function shade(hex, f) {
+  const n = parseInt(hex.slice(1), 16);
+  let r = n >> 16, g = (n >> 8) & 255, b = n & 255;
+  if (f < 0) { r *= 1 + f; g *= 1 + f; b *= 1 + f; }
+  else { r += (255 - r) * f; g += (255 - g) * f; b += (255 - b) * f; }
+  return `rgb(${r | 0},${g | 0},${b | 0})`;
+}
+const lerp = (a, b, t) => a + (b - a) * t;
+const ease = t => t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+function lerpAng(a, b, t) {
+  let d = b - a;
+  while (d > Math.PI) d -= 2 * Math.PI;
+  while (d < -Math.PI) d += 2 * Math.PI;
+  return a + d * t;
+}
+function rrect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+function store(k, v) { try { if (v === undefined) return localStorage.getItem(k); localStorage.setItem(k, v); } catch (e) { return null; } }
+
+// ---------- Queue path (snake) ----------
+const pathPts = [];
+(function buildPath() {
+  const rows = [312, 268, 224, 180, 136, 92];
+  const L = 34, R = 506;
+  pathPts.push({ x: FRONT.x, y: rows[0] });
+  let goingLeft = true;
+  for (let i = 0; i < rows.length; i++) {
+    pathPts.push({ x: goingLeft ? L : R, y: rows[i] });
+    if (i + 1 < rows.length) pathPts.push({ x: goingLeft ? L : R, y: rows[i + 1] });
+    goingLeft = !goingLeft;
+  }
+})();
+const pathLen = [0];
+for (let i = 1; i < pathPts.length; i++)
+  pathLen.push(pathLen[i - 1] + Math.hypot(pathPts[i].x - pathPts[i - 1].x, pathPts[i].y - pathPts[i - 1].y));
+const PATH_TOTAL = pathLen[pathLen.length - 1];
+function pointAt(s) {
+  for (let i = 1; i < pathPts.length; i++) {
+    if (s <= pathLen[i]) {
+      const t = (s - pathLen[i - 1]) / (pathLen[i] - pathLen[i - 1]);
+      return { x: lerp(pathPts[i - 1].x, pathPts[i].x, t), y: lerp(pathPts[i - 1].y, pathPts[i].y, t) };
+    }
+  }
+  return null;
+}
+
+// ---------- Game state ----------
+let G = null;
+let level = parseInt(store('busjam-level') || '1', 10) || 1;
+
+function slotPos(i) { return { x: SLOT_X0 + i * 70 + SLOT_W / 2, y: SLOT_Y + SLOT_H / 2 }; }
+
+function generate(lv) {
+  const rng = rngFrom(lv * 9973 + 17);
+  const N = lv <= 1 ? 6 : lv <= 3 ? 7 : 8;
+  const numColors = Math.min(3 + Math.floor(lv / 2), COLORS.length);
+  const windowSize = lv <= 2 ? 2 : lv % 5 === 0 ? 4 : 3;
+  const occ = new Array(N * N).fill(-1);
+  const vehicles = [];
+  const target = Math.floor(N * N * 0.8 / 2.3);
+
+  const cellsOf = (x, y, len, dir) => {
+    const out = [];
+    for (let k = 0; k < len; k++) out.push(dir % 2 ? [x + k, y] : [x, y + k]);
+    return out;
+  };
+  const pathOf = (x, y, len, dir) => {
+    const out = [];
+    let fx = x, fy = y;
+    if (dir === 1) fx = x + len - 1;
+    if (dir === 2) fy = y + len - 1;
+    const [dx, dy] = DIRS[dir];
+    for (let k = 1; ; k++) {
+      const cx = fx + dx * k, cy = fy + dy * k;
+      if (cx < 0 || cy < 0 || cx >= N || cy >= N) break;
+      out.push([cx, cy]);
+    }
+    return out;
+  };
+
+  // Each new vehicle needs a clear exit path among those already placed,
+  // so removing them in reverse placement order always works.
+  for (let a = 0; a < 6000 && vehicles.length < target; a++) {
+    const len = rng() < 0.3 ? 3 : 2;
+    const dir = Math.floor(rng() * 4);
+    const horiz = dir % 2 === 1;
+    const x = Math.floor(rng() * (N - (horiz ? len - 1 : 0)));
+    const y = Math.floor(rng() * (N - (horiz ? 0 : len - 1)));
+    const cells = cellsOf(x, y, len, dir);
+    if (cells.some(([cx, cy]) => occ[cy * N + cx] !== -1)) continue;
+    if (pathOf(x, y, len, dir).some(([cx, cy]) => occ[cy * N + cx] !== -1)) continue;
+    const id = vehicles.length;
+    cells.forEach(([cx, cy]) => occ[cy * N + cx] = id);
+    const cap = len === 3 ? 10 : (rng() < 0.5 ? 4 : 6);
+    vehicles.push({ id, x, y, len, dir, cap, color: COLORS[Math.floor(rng() * numColors)],
+      state: 'board', filled: 0, reserved: 0, bump: 0, bumpT: 0, bumpMax: 0, slot: -1, alpha: 1 });
+  }
+
+  // Build passenger queue following the solution order, interleaving a window of vehicles.
+  const order = vehicles.slice().reverse();
+  const queue = [];
+  const active = [];
+  let idx = 0;
+  const refill = () => { while (active.length < windowSize && idx < order.length) { const v = order[idx++]; active.push({ v, rem: v.cap }); } };
+  refill();
+  while (active.length) {
+    const ai = rng() < 0.45 ? 0 : Math.floor(rng() * active.length);
+    const a = active[ai];
+    const chunk = Math.min(a.rem, 1 + Math.floor(rng() * 4));
+    for (let k = 0; k < chunk; k++) queue.push(a.v.color);
+    a.rem -= chunk;
+    if (a.rem === 0) { active.splice(ai, 1); refill(); }
+  }
+  return { N, occ, vehicles, queue, hard: windowSize };
+}
+
+function startLevel(lv) {
+  level = lv;
+  store('busjam-level', String(lv));
+  const g = generate(lv);
+  const cell = Math.floor(Math.min(450 / g.N, 380 / g.N));
+  G = {
+    ...g, cell,
+    ox: (W - g.N * cell) / 2, oy: 510 + (380 - g.N * cell) / 2,
+    slots: new Array(MAX_SLOTS).fill(null), slotCount: BASE_SLOTS,
+    flyers: [], particles: [], shift: 0, boardTimer: 0, stuckTimer: 0, winTimer: 0,
+    state: 'play', toast: null, vipMode: false,
+    boosters: { slot: 1, vip: 1, sort: 1 },
+    total: g.queue.length, time: 0,
+  };
+  if (lv === 1) toast('Tik op een bus om hem te laten wegrijden!', 3);
+}
+
+function toast(msg, dur = 1.6) { G.toast = { msg, t: dur }; }
+
+// ---------- Vehicle geometry ----------
+function gridPose(v) {
+  const { ox, oy, cell } = G;
+  const horiz = v.dir % 2 === 1;
+  let cx = horiz ? ox + (v.x + v.len / 2) * cell : ox + (v.x + 0.5) * cell;
+  let cy = horiz ? oy + (v.y + 0.5) * cell : oy + (v.y + v.len / 2) * cell;
+  const [dx, dy] = DIRS[v.dir];
+  cx += dx * v.bump; cy += dy * v.bump;
+  return { x: cx, y: cy, a: ANG[v.dir], L: v.len * cell - 8, Wd: cell - 12 };
+}
+function parkedPose(v) {
+  const p = slotPos(v.slot);
+  return { x: p.x, y: p.y, a: -Math.PI / 2, L: v.len === 3 ? 98 : 74, Wd: 42 };
+}
+function blockInfo(v) {
+  const { N, occ } = G;
+  let fx = v.x, fy = v.y;
+  if (v.dir === 1) fx = v.x + v.len - 1;
+  if (v.dir === 2) fy = v.y + v.len - 1;
+  const [dx, dy] = DIRS[v.dir];
+  for (let k = 1; ; k++) {
+    const cx = fx + dx * k, cy = fy + dy * k;
+    if (cx < 0 || cy < 0 || cx >= N || cy >= N) return { free: true };
+    const o = occ[cy * N + cx];
+    if (o !== -1) return { free: false, d: k - 1, blocker: G.vehicles[o] };
+  }
+}
+function freeSlot() {
+  for (let i = 0; i < G.slotCount; i++) if (!G.slots[i]) return i;
+  return -1;
+}
+function removeFromGrid(v) {
+  for (let i = 0; i < G.occ.length; i++) if (G.occ[i] === v.id) G.occ[i] = -1;
+}
+function sendToSlot(v, lift) {
+  const s = freeSlot();
+  v.slot = s; G.slots[s] = v;
+  removeFromGrid(v);
+  v.pose = gridPose(v);
+  v.bump = 0;
+  if (lift) { v.state = 'fly'; v.flyT = 0; v.flyFrom = { ...v.pose }; v.lift = true; }
+  else v.state = 'exit';
+}
+
+// ---------- Input ----------
+cv.addEventListener('pointerdown', e => {
+  const x = (e.clientX - offX) / scale, y = (e.clientY - offY) / scale;
+  if (!G) return;
+  if (G.state !== 'play') { onOverlayTap(x, y); return; }
+
+  // Restart button
+  if (Math.hypot(x - 46, y - 44) < 30) { startLevel(level); return; }
+  // Boosters
+  const bs = boosterButtons();
+  for (const b of bs) if (Math.hypot(x - b.x, y - b.y) < 40) { useBooster(b.key); return; }
+  // Locked slots
+  for (let i = G.slotCount; i < MAX_SLOTS; i++) {
+    const sx = SLOT_X0 + i * 70;
+    if (x > sx && x < sx + SLOT_W && y > SLOT_Y && y < SLOT_Y + SLOT_H) { useBooster('slot'); return; }
+  }
+  // Grid
+  const { ox, oy, cell, N } = G;
+  const gx = Math.floor((x - ox) / cell), gy = Math.floor((y - oy) / cell);
+  if (gx < 0 || gy < 0 || gx >= N || gy >= N) return;
+  const id = G.occ[gy * N + gx];
+  if (id === -1) return;
+  tapVehicle(G.vehicles[id]);
+});
+
+function tapVehicle(v) {
+  if (v.state !== 'board' || v.bumpT > 0) return;
+  if (freeSlot() === -1) { toast('Geen vrije parkeerplek!'); v.shake = 0.3; return; }
+  if (G.vipMode) {
+    G.vipMode = false; G.boosters.vip--;
+    sendToSlot(v, true);
+    return;
+  }
+  const b = blockInfo(v);
+  if (b.free) sendToSlot(v, false);
+  else {
+    v.bumpMax = Math.max(4, b.d * G.cell + 4);
+    v.bumpT = 0.001;
+    b.blocker.shake = 0.25;
+  }
+}
+
+function boosterButtons() {
+  return [
+    { key: 'slot', x: 120, y: 950, label: 'Extra plek' },
+    { key: 'sort', x: 270, y: 950, label: 'Sorteer' },
+    { key: 'vip', x: 420, y: 950, label: 'VIP' },
+  ];
+}
+function useBooster(key) {
+  if (G.boosters[key] <= 0) { toast('Booster op!'); return; }
+  if (key === 'slot') {
+    if (G.slotCount >= MAX_SLOTS) { toast('Maximaal aantal plekken'); return; }
+    G.slotCount++; G.boosters.slot--; G.stuckTimer = 0;
+    toast('Extra parkeerplek!');
+  } else if (key === 'vip') {
+    G.vipMode = !G.vipMode;
+    if (G.vipMode) toast('Tik een bus om hem eruit te tillen', 2);
+  } else if (key === 'sort') {
+    const need = {};
+    for (const v of G.slots) if (v && v.state === 'parked') need[v.color] = (need[v.color] || 0) + v.cap - v.reserved;
+    const front = [], rest = [];
+    for (const c of G.queue) { if (need[c] > 0) { front.push(c); need[c]--; } else rest.push(c); }
+    if (!front.length) { toast('Niets om te sorteren'); return; }
+    G.queue = front.concat(rest); G.boosters.sort--; G.stuckTimer = 0;
+    toast('Wachtrij gesorteerd!');
+  }
+}
+
+function onOverlayTap(x, y) {
+  if (G.state === 'win') {
+    if (y > 560 && y < 640) startLevel(level + 1);
+  } else if (G.state === 'lose') {
+    if (y > 540 && y < 610 && (G.boosters.slot > 0 || G.boosters.sort > 0)) {
+      G.state = 'play';
+      useBooster(G.boosters.slot > 0 && G.slotCount < MAX_SLOTS ? 'slot' : 'sort');
+    } else if (y > 625 && y < 695) startLevel(level);
+  }
+}
+
+// ---------- Update ----------
+function update(dt) {
+  G.time += dt;
+  if (G.toast) { G.toast.t -= dt; if (G.toast.t <= 0) G.toast = null; }
+  G.shift = Math.max(0, G.shift - dt * 16);
+
+  for (const v of G.vehicles) {
+    if (v.shake) v.shake = Math.max(0, v.shake - dt);
+    if (v.bumpT > 0) {
+      v.bumpT += dt;
+      const t = v.bumpT;
+      const fwd = 0.1, back = 0.18;
+      if (t < fwd) v.bump = v.bumpMax * ease(t / fwd);
+      else if (t < fwd + back) v.bump = v.bumpMax * (1 - ease((t - fwd) / back));
+      else { v.bump = 0; v.bumpT = 0; }
+    }
+    if (v.state === 'exit') {
+      const [dx, dy] = DIRS[v.dir];
+      v.speed = (v.speed || 300) + dt * 2500;
+      v.pose.x += dx * v.speed * dt; v.pose.y += dy * v.speed * dt;
+      const m = v.pose.L / 2 + 6;
+      const { ox, oy, cell, N } = G;
+      if (v.pose.x < ox - m || v.pose.x > ox + N * cell + m || v.pose.y < oy - m || v.pose.y > oy + N * cell + m) {
+        v.state = 'fly'; v.flyT = 0; v.flyFrom = { ...v.pose };
+      }
+    } else if (v.state === 'fly') {
+      v.flyT += dt / (v.lift ? 0.6 : 0.45);
+      const t = ease(Math.min(1, v.flyT));
+      const to = parkedPose(v), f = v.flyFrom;
+      v.pose = {
+        x: lerp(f.x, to.x, t), y: lerp(f.y, to.y, t), a: lerpAng(f.a, to.a, t),
+        L: lerp(f.L, to.L, t), Wd: lerp(f.Wd, to.Wd, t),
+      };
+      v.liftH = v.lift ? Math.sin(Math.PI * Math.min(1, v.flyT)) * 0.35 : 0;
+      if (v.flyT >= 1) { v.state = 'parked'; v.pose = to; v.liftH = 0; v.land = 0.25; }
+    } else if (v.state === 'parked') {
+      if (v.land) v.land = Math.max(0, v.land - dt);
+      if (v.filled >= v.cap) {
+        v.waitLeave = (v.waitLeave || 0) + dt;
+        if (v.waitLeave > 0.25) {
+          v.state = 'leave'; G.slots[v.slot] = null; v.vy = 0;
+          puff(v.pose.x, v.pose.y + 40, '#ffffff', 10);
+        }
+      }
+    } else if (v.state === 'leave') {
+      v.vy += dt * 2200;
+      v.pose.y -= v.vy * dt;
+      v.alpha = Math.max(0, Math.min(1, (v.pose.y - 120) / 150));
+      if (v.pose.y < 100) v.state = 'gone';
+    }
+  }
+
+  // Boarding
+  G.boardTimer -= dt;
+  if (G.boardTimer <= 0 && G.queue.length && G.shift < 0.6) {
+    const c = G.queue[0];
+    let best = null;
+    for (const v of G.slots) {
+      if (v && v.state === 'parked' && v.color === c && v.reserved < v.cap) {
+        if (!best || v.cap - v.reserved < best.cap - best.reserved) best = v;
+      }
+    }
+    if (best) {
+      G.queue.shift(); G.shift += 1;
+      best.reserved++;
+      const sp = slotPos(best.slot);
+      G.flyers.push({ color: c, x0: FRONT.x, y0: FRONT.y, x1: sp.x, y1: sp.y, t: 0, v: best });
+      G.boardTimer = 0.055;
+    }
+  }
+  for (const f of G.flyers) {
+    f.t += dt / 0.22;
+    if (f.t >= 1) { f.v.filled++; f.done = true; }
+  }
+  G.flyers = G.flyers.filter(f => !f.done);
+
+  // Particles
+  for (const p of G.particles) { p.x += p.vx * dt; p.y += p.vy * dt; p.vy += p.g * dt; p.life -= dt; }
+  G.particles = G.particles.filter(p => p.life > 0);
+
+  if (G.state !== 'play') return;
+
+  // Win
+  if (!G.queue.length && !G.flyers.length && G.vehicles.every(v => v.state === 'gone')) {
+    G.winTimer += dt;
+    if (G.winTimer > 0.3) { G.state = 'win'; confetti(); }
+    return;
+  }
+  // Stuck check
+  const moving = G.vehicles.some(v => v.state === 'exit' || v.state === 'fly' || v.state === 'leave');
+  const fullSlots = freeSlot() === -1;
+  const c = G.queue[0];
+  const canBoard = G.slots.some(v => v && v.state === 'parked' && v.color === c && v.reserved < v.cap);
+  const filling = G.slots.some(v => v && v.state === 'parked' && v.filled >= v.cap);
+  if (G.queue.length && fullSlots && !moving && !canBoard && !filling && !G.flyers.length) {
+    G.stuckTimer += dt;
+    if (G.stuckTimer > 0.8) G.state = 'lose';
+  } else G.stuckTimer = 0;
+}
+
+function puff(x, y, color, n) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, s = 40 + Math.random() * 120;
+    G.particles.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, g: -60, life: 0.5 + Math.random() * 0.4, max: 0.9, r: 6 + Math.random() * 8, color });
+  }
+}
+function confetti() {
+  for (let i = 0; i < 140; i++) {
+    G.particles.push({ x: Math.random() * W, y: -20 - Math.random() * 200, vx: (Math.random() - 0.5) * 120, vy: 100 + Math.random() * 200,
+      g: 200, life: 3 + Math.random() * 2, max: 5, r: 4 + Math.random() * 4, color: COLORS[i % COLORS.length], conf: true, rot: Math.random() * 6 });
+  }
+}
+
+// ---------- Drawing ----------
+function drawPerson(x, y, color, s = 1) {
+  ctx.fillStyle = 'rgba(0,0,0,0.18)';
+  ctx.beginPath(); ctx.ellipse(x, y + 7 * s, 8 * s, 3.5 * s, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = shade(color, -0.25);
+  ctx.beginPath(); ctx.arc(x, y + 1 * s, 8 * s, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = color;
+  ctx.beginPath(); ctx.arc(x, y, 7.4 * s, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = shade(color, -0.1);
+  ctx.beginPath(); ctx.arc(x, y - 7 * s, 6 * s, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = shade(color, 0.35);
+  ctx.beginPath(); ctx.arc(x - 2 * s, y - 9 * s, 2.2 * s, 0, Math.PI * 2); ctx.fill();
+}
+
+function drawVehicle(v, p) {
+  const L = p.L, Wd = p.Wd;
+  ctx.save();
+  let sx = 0;
+  if (v.shake) sx = Math.sin(v.shake * 80) * 3;
+  ctx.translate(p.x + sx, p.y);
+  const lift = v.liftH || 0;
+  if (lift) {
+    ctx.fillStyle = 'rgba(0,0,0,0.15)';
+    ctx.beginPath(); ctx.ellipse(0, 18, L / 2, Wd / 2, p.a, 0, Math.PI * 2); ctx.fill();
+    ctx.scale(1 + lift, 1 + lift);
+  }
+  if (v.land) ctx.scale(1 + v.land * 0.4, 1 + v.land * 0.4);
+  ctx.rotate(p.a);
+  ctx.globalAlpha = v.alpha;
+  const c = v.color, big = v.len === 3, van = !big && v.cap === 6;
+
+  // shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.25)';
+  rrect(-L / 2 + 2, -Wd / 2 + 4, L, Wd, 8); ctx.fill();
+  // wheels
+  ctx.fillStyle = '#222';
+  const wx = [-L / 2 + L * 0.2, L / 2 - L * 0.2];
+  for (const x of wx) { rrect(x - 6, -Wd / 2 - 2, 12, 5, 2); ctx.fill(); rrect(x - 6, Wd / 2 - 3, 12, 5, 2); ctx.fill(); }
+  // body
+  ctx.fillStyle = shade(c, -0.3);
+  rrect(-L / 2, -Wd / 2, L, Wd, big ? 8 : 9); ctx.fill();
+  ctx.fillStyle = c;
+  rrect(-L / 2 + 1.5, -Wd / 2 + 1.5, L - 3, Wd - 5, big ? 7 : 8); ctx.fill();
+  // windows along sides
+  if (big || van) {
+    ctx.fillStyle = 'rgba(30,40,80,0.55)';
+    const n = big ? 5 : 2;
+    const span = L * (big ? 0.72 : 0.5), start = -L / 2 + L * 0.08;
+    for (let i = 0; i < n; i++) {
+      const wx2 = start + (span / n) * i + 1;
+      ctx.fillRect(wx2, -Wd / 2 + 2, span / n - 3, 3);
+      ctx.fillRect(wx2, Wd / 2 - 6, span / n - 3, 3);
+    }
+  }
+  // windshield
+  ctx.fillStyle = '#bfe6ff';
+  rrect(L / 2 - (big ? 9 : 13), -Wd / 2 + 4, big ? 6 : 8, Wd - 9, 3); ctx.fill();
+  if (!big && !van) {
+    ctx.fillStyle = '#9ccbe8';
+    rrect(-L / 2 + 5, -Wd / 2 + 5, 6, Wd - 11, 2); ctx.fill();
+  }
+  // roof
+  ctx.fillStyle = shade(c, 0.18);
+  const rx0 = -L / 2 + (big ? 6 : 12), rx1 = L / 2 - (big ? 14 : 16);
+  rrect(rx0, -Wd / 2 + 6, rx1 - rx0, Wd - 14, 5); ctx.fill();
+  // arrow (only on the board)
+  if (v.state === 'board' || v.state === 'exit') {
+    ctx.strokeStyle = '#fff'; ctx.fillStyle = '#fff'; ctx.lineWidth = 3; ctx.lineCap = 'round';
+    const al = Math.min(L * 0.5, 34), cy = -1;
+    ctx.beginPath(); ctx.moveTo(-al / 2, cy); ctx.lineTo(al / 2 - 4, cy); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(al / 2 + 2, cy); ctx.lineTo(al / 2 - 7, cy - 6); ctx.lineTo(al / 2 - 7, cy + 6); ctx.closePath(); ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawTop() {
+  // grass
+  ctx.fillStyle = '#7cc35a'; ctx.fillRect(0, 0, W, 340);
+  ctx.fillStyle = '#86cd63';
+  for (let i = 0; i < 12; i++) ctx.fillRect(0, i * 30, W, 14);
+  // walkway
+  ctx.strokeStyle = '#e9eef4'; ctx.lineWidth = 34; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  ctx.beginPath(); pathPts.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)); ctx.stroke();
+  ctx.strokeStyle = '#c9d2dc'; ctx.lineWidth = 28;
+  ctx.stroke();
+  // road / parking strip
+  ctx.fillStyle = '#7d8592'; ctx.fillRect(0, 336, W, 160);
+  ctx.fillStyle = '#6c7380'; ctx.fillRect(0, 336, W, 6);
+  // slots
+  for (let i = 0; i < MAX_SLOTS; i++) {
+    const x = SLOT_X0 + i * 70;
+    if (i < G.slotCount) {
+      ctx.fillStyle = '#5d6471'; rrect(x, SLOT_Y, SLOT_W, SLOT_H, 12); ctx.fill();
+      ctx.strokeStyle = '#a7aebb'; ctx.lineWidth = 3; ctx.setLineDash([]); ctx.stroke();
+    } else {
+      ctx.fillStyle = '#6a7180'; rrect(x, SLOT_Y, SLOT_W, SLOT_H, 12); ctx.fill();
+      ctx.strokeStyle = '#4b5260'; ctx.lineWidth = 3; ctx.setLineDash([8, 6]); ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = '#3ad05a'; ctx.font = 'bold 40px system-ui, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText('+', x + SLOT_W / 2, SLOT_Y + SLOT_H / 2 + 2);
+    }
+  }
+  // queue
+  const n = G.queue.length;
+  const maxVisible = Math.floor(PATH_TOTAL / SPACING);
+  const vis = Math.min(n, maxVisible);
+  for (let i = vis - 1; i >= 0; i--) {
+    const p = pointAt((i + G.shift) * SPACING);
+    if (p) drawPerson(p.x, p.y, G.queue[i]);
+  }
+  if (n > vis) {
+    ctx.fillStyle = 'rgba(0,0,0,0.5)'; rrect(W - 92, 62, 70, 26, 13); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 16px system-ui, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('+' + (n - vis), W - 57, 75);
+  }
+}
+
+function drawHeader() {
+  // restart
+  ctx.fillStyle = '#1f4fbf'; ctx.beginPath(); ctx.arc(46, 44, 28, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#3b82f6'; ctx.beginPath(); ctx.arc(46, 42, 24, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.arc(46, 42, 11, -0.3, Math.PI * 1.5); ctx.stroke();
+  ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.moveTo(46, 25); ctx.lineTo(56, 31); ctx.lineTo(46, 37); ctx.fill();
+
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  if (G.hard >= 3) {
+    ctx.font = 'bold 20px system-ui, sans-serif';
+    ctx.lineWidth = 4; ctx.strokeStyle = '#3b1f6b';
+    const t = G.hard >= 4 ? 'SUPER MOEILIJK' : 'MOEILIJK';
+    ctx.strokeText(t, W / 2, 24); ctx.fillStyle = '#c9a2ff'; ctx.fillText(t, W / 2, 24);
+  }
+  ctx.font = '900 34px system-ui, sans-serif';
+  ctx.lineWidth = 6; ctx.strokeStyle = '#1b1b1b';
+  ctx.strokeText('LEVEL ' + level, W / 2, 54); ctx.fillStyle = '#fff'; ctx.fillText('LEVEL ' + level, W / 2, 54);
+  // progress
+  const done = 1 - G.queue.length / G.total;
+  ctx.fillStyle = 'rgba(0,0,0,0.35)'; rrect(W - 140, 30, 110, 14, 7); ctx.fill();
+  ctx.fillStyle = '#ffd21f'; rrect(W - 140, 30, Math.max(14, 110 * done), 14, 7); ctx.fill();
+}
+
+function drawSlotsInfo() {
+  for (const v of G.slots) {
+    if (!v || v.state !== 'parked') continue;
+    const p = slotPos(v.slot);
+    const left = v.cap - v.filled;
+    ctx.fillStyle = shade(v.color, -0.15); rrect(p.x - 22, SLOT_Y + SLOT_H + 8, 44, 24, 10); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 17px system-ui, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(left, p.x, SLOT_Y + SLOT_H + 21);
+  }
+}
+
+function drawBoard() {
+  ctx.fillStyle = '#d7dee8'; ctx.fillRect(0, 496, W, H - 496);
+  const { ox, oy, cell, N } = G;
+  ctx.fillStyle = '#e4a91a'; rrect(ox - 10, oy - 10, N * cell + 20, N * cell + 20, 10); ctx.fill();
+  ctx.fillStyle = '#9aa3ae'; ctx.fillRect(ox - 4, oy - 4, N * cell + 8, N * cell + 8);
+  ctx.strokeStyle = 'rgba(255,255,255,0.12)'; ctx.lineWidth = 1;
+  for (let i = 0; i <= N; i++) {
+    ctx.beginPath(); ctx.moveTo(ox + i * cell, oy); ctx.lineTo(ox + i * cell, oy + N * cell); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(ox, oy + i * cell); ctx.lineTo(ox + N * cell, oy + i * cell); ctx.stroke();
+  }
+}
+
+function drawBoosters() {
+  const icons = { slot: '🅿️', sort: '🔀', vip: '🚁' };
+  for (const b of boosterButtons()) {
+    const active = b.key === 'vip' && G.vipMode;
+    ctx.fillStyle = '#0d3b9c'; ctx.beginPath(); ctx.arc(b.x, b.y + 3, 38, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = active ? '#ffb31f' : '#2563eb'; ctx.beginPath(); ctx.arc(b.x, b.y, 36, 0, Math.PI * 2); ctx.fill();
+    ctx.font = '32px system-ui, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.globalAlpha = G.boosters[b.key] > 0 ? 1 : 0.4;
+    ctx.fillText(icons[b.key], b.x, b.y);
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = G.boosters[b.key] > 0 ? '#22c55e' : '#ef4444';
+    ctx.beginPath(); ctx.arc(b.x + 28, b.y - 28, 13, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 15px system-ui, sans-serif';
+    ctx.fillText(G.boosters[b.key], b.x + 28, b.y - 27);
+    ctx.fillStyle = '#334155'; ctx.font = 'bold 13px system-ui, sans-serif';
+    ctx.fillText(b.label, b.x, b.y + 50);
+  }
+}
+
+function drawOverlay() {
+  if (G.state === 'play') return;
+  ctx.fillStyle = 'rgba(10,20,40,0.6)'; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = '#fff'; rrect(70, 380, 400, 340, 24); ctx.fill();
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const btn = (y, txt, col) => {
+    ctx.fillStyle = shade(col, -0.3); rrect(130, y + 4, 280, 66, 18); ctx.fill();
+    ctx.fillStyle = col; rrect(130, y, 280, 66, 18); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 24px system-ui, sans-serif'; ctx.fillText(txt, 270, y + 34);
+  };
+  if (G.state === 'win') {
+    ctx.fillStyle = '#16a34a'; ctx.font = '900 40px system-ui, sans-serif'; ctx.fillText('Gelukt! 🎉', 270, 440);
+    ctx.fillStyle = '#475569'; ctx.font = '20px system-ui, sans-serif';
+    ctx.fillText(`Level ${level} voltooid`, 270, 495);
+    btn(565, 'Volgende level', '#22c55e');
+  } else {
+    ctx.fillStyle = '#dc2626'; ctx.font = '900 40px system-ui, sans-serif'; ctx.fillText('Vast! 😵', 270, 440);
+    ctx.fillStyle = '#475569'; ctx.font = '19px system-ui, sans-serif';
+    ctx.fillText('Alle parkeerplekken zijn bezet.', 270, 495);
+    const can = (G.boosters.slot > 0 && G.slotCount < MAX_SLOTS) || G.boosters.sort > 0;
+    if (can) btn(540, G.boosters.slot > 0 && G.slotCount < MAX_SLOTS ? 'Extra plek gebruiken' : 'Wachtrij sorteren', '#2563eb');
+    btn(628, 'Opnieuw', '#f97316');
+  }
+}
+
+function render() {
+  ctx.fillStyle = '#1d2a3a'; ctx.fillRect(-offX / scale, -offY / scale, innerWidth / scale, innerHeight / scale);
+  drawTop();
+  drawBoard();
+  // board vehicles
+  for (const v of G.vehicles) if (v.state === 'board') drawVehicle(v, gridPose(v));
+  for (const v of G.vehicles) if (v.state === 'parked' || v.state === 'leave') drawVehicle(v, v.pose);
+  drawSlotsInfo();
+  for (const v of G.vehicles) if (v.state === 'exit' || v.state === 'fly') drawVehicle(v, v.pose);
+  // boarding passengers
+  for (const f of G.flyers) {
+    const t = f.t;
+    const x = lerp(f.x0, f.x1, t), y = lerp(f.y0, f.y1, t) - Math.sin(Math.PI * t) * 40;
+    drawPerson(x, y, f.color, 1 - t * 0.4);
+  }
+  for (const p of G.particles) {
+    ctx.globalAlpha = Math.max(0, Math.min(1, p.life / p.max * 2));
+    ctx.fillStyle = p.color;
+    if (p.conf) { ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.rot + p.life * 5); ctx.fillRect(-p.r, -p.r / 2, p.r * 2, p.r); ctx.restore(); }
+    else { ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill(); }
+  }
+  ctx.globalAlpha = 1;
+  drawHeader();
+  drawBoosters();
+  if (G.toast) {
+    ctx.globalAlpha = Math.min(1, G.toast.t * 3);
+    ctx.font = 'bold 18px system-ui, sans-serif';
+    const w = ctx.measureText(G.toast.msg).width + 40;
+    ctx.fillStyle = 'rgba(15,23,42,0.85)'; rrect(W / 2 - w / 2, 470, w, 40, 20); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(G.toast.msg, W / 2, 491);
+    ctx.globalAlpha = 1;
+  }
+  drawOverlay();
+}
+
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  update(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+resize();
+startLevel(level);
+requestAnimationFrame(frame);
+
+// Debug hook for automated testing
+window.__game = () => G;
+window.__start = startLevel;
+</script>
+</body>
+</html>
